@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from neo4j import GraphDatabase
 import subprocess
 
@@ -10,7 +11,7 @@ CONFIG = {
     "NEO4J_URI": "bolt://localhost:7687",
     "NEO4J_USER": "neo4j",
     "NEO4J_PASSWORD": "Seb%110978",
-    "EXCLUDED_DIRS": {".git", ".obsidian", ".trash"},
+    "EXCLUDED_DIRS": {".git", ".obsidian", ".trash","_ASSETS/templates", "_GESTION"},
     "EXCLUDED_FILES": {".gitignore"},
     "MAX_FILE_SIZE": 10_000_000  # 10 Mo
 }
@@ -60,6 +61,129 @@ def get_git_dates_for_file(file_path, vault_path):
         logger.error(f"Error getting Git dates for {file_path}: {e}")
         return {"created_at": None, "modified_at": None}
 
+def create_tag_hierarchy(session, note_path, vault_id, full_tag):
+    """
+    Crée la hiérarchie de tags pour un tag complet (ex: "projet/developpement/python")
+    et lie la note à chaque niveau.
+    """
+    parts = full_tag.split('/')
+    current_path = ""
+
+    for i, part in enumerate(parts):
+        if i == 0:
+            current_path = part
+        else:
+            current_path = f"{current_path}/{part}"
+
+        # Créer ou récupérer le tag
+        session.run("""
+            MERGE (tag:Tag {name: $tag_name})
+            SET tag.level = $level, tag.label = $label
+            RETURN tag
+        """, tag_name=current_path, level=i, label=part)
+
+        # Lier la note au tag
+        session.run("""
+            MATCH (note:Note {path: $note_path, vault_id: $vault_id})
+            MATCH (tag:Tag {name: $tag_name})
+            MERGE (note)-[:HAS_TAG]->(tag)
+        """, note_path=note_path, vault_id=vault_id, tag_name=current_path)
+
+        # Créer la relation PARENT_OF avec le parent (sauf racine)
+        if i > 0:
+            parent_path = "/".join(parts[:i])
+            session.run("""
+                MATCH (parent:Tag {name: $parent_name})
+                MATCH (child:Tag {name: $child_name})
+                MERGE (parent)-[:PARENT_OF]->(child)
+            """, parent_name=parent_path, child_name=current_path)
+
+# —— Extraction des tags ——
+def extract_tags_from_frontmatter(content):
+    """
+    Extrait les tags du frontmatter (entre ---)
+    Gère deux formats :
+    - tags: [tag1, tag2]
+    - tags:\n  - tag1\n  - tag2
+    Retourne une liste de tags (en minuscules)
+    """
+    # Nettoyer le début du fichier : supprimer BOM, espaces, sauts de ligne
+    content = content.lstrip()
+
+    logger.info(f"✅!! Content (nettoyé) : {content[:500]}...")
+
+    # Cherche le frontmatter entre ---, en commençant par la première ligne non vide
+    frontmatter_pattern = r'^---\s*\n(.*?)\n---'
+    match = re.search(frontmatter_pattern, content, re.DOTALL | re.MULTILINE)
+    if not match:
+        logger.info("❌ Aucun frontmatter trouvé (après nettoyage)")
+        return []
+
+    frontmatter = match.group(1)
+    logger.info(f"✅!! frontmatter reg : {frontmatter[:500]}...")
+
+    # Format 1 : tags: [tag1, tag2]
+    tags_pattern_brackets = r'tags:\s*\[([^\]]*)\]'
+    tags_match_brackets = re.search(tags_pattern_brackets, frontmatter, re.MULTILINE | re.DOTALL)
+    logger.info(f"✅!! tags_format1 : {tags_match_brackets}")
+    if tags_match_brackets:
+        tags_str = tags_match_brackets.group(1)
+        tags = [tag.strip().strip('"').strip("'").strip() for tag in tags_str.split(',')]
+        return [tag.lower() for tag in tags if tag]
+
+    # Format 2 : tags:\n  - tag1\n  - tag2
+    tags_pattern_list = r'tags:\s*((?:\n\s*-\s*.+)+)'
+    tags_match_list = re.search(tags_pattern_list, frontmatter, re.MULTILINE | re.DOTALL)
+    logger.info(f"✅!! tags_format2 : {tags_match_list}")
+    if not tags_match_list:
+        return []
+
+    tags_block = tags_match_list.group(1)
+    logger.info(f"✅!! tags_block2 : {tags_block[:500]}...")
+    # Extraire les lignes qui commencent par -
+    tag_lines = [line.strip() for line in tags_block.splitlines() if line.strip().startswith('-')]
+    tags = []
+    for line in tag_lines:
+        # Enlever le - et les espaces
+        tag = line[1:].strip().strip('"').strip("'").strip()
+        if tag:
+            tags.append(tag)
+    return [tag.lower() for tag in tags]
+
+def extract_tags_from_content(content):
+    """
+    Extrait les tags au format #[tag] ou #tag du contenu d'une note
+    Ne prend en compte que les tags sans espace après le # (ex: #tag, #[tag])
+    Ignore les tags dans :
+    - les blocs de code (``` ou ~~~)
+    - le code en ligne (`...`)
+    - les commentaires HTML (<!-- ... -->)
+    Retourne une liste de tags (sans #, en minuscules)
+    """
+    # 1. Supprimer les blocs de code (``` ou ~~~)
+    content = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+    content = re.sub(r'~~~.*?~~~', '', content, flags=re.DOTALL)
+
+    # 2. Supprimer le code en ligne (`...`)
+    content = re.sub(r'`[^`]*`', '', content)
+
+    # 3. Supprimer les commentaires HTML (<!-- ... -->)
+    content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
+
+    # 4. Extraire les tags #tag ou #[tag] du texte restant
+    pattern = r'#([a-zA-Z0-9_\-]+)'
+    matches = re.findall(pattern, content)
+    return [tag.strip().lower() for tag in matches if tag.strip()]
+
+def get_all_tags(content):
+    """
+    Retourne tous les tags d'une note (frontmatter + contenu)
+    """
+    tags_from_fm = extract_tags_from_frontmatter(content)
+    tags_from_content = extract_tags_from_content(content)
+    all_tags = set(tags_from_fm + tags_from_content)
+    return list(all_tags)
+
 # —— Fonctions Neo4j ——
 def create_or_update_note(session, path, name, level, vault_id, created_at, modified_at, contenu):
     try:
@@ -83,11 +207,23 @@ def create_parent_relation(session, parent_path, child_path, vault_id):
     except Exception as e:
         logger.error(f"Erreur lors de la création de la relation PARENT_OF entre {parent_path} et {child_path}: {e}")
 
+def create_tag_relation(session, note_path, vault_id, tag_name):
+    """Crée un nœud Tag et la relation HAS_TAG vers la note"""
+    try:
+        session.run("""
+            MERGE (tag:Tag {name: $tag_name})
+            WITH tag
+            MATCH (note:Note {path: $note_path, vault_id: $vault_id})
+            MERGE (note)-[:HAS_TAG]->(tag)
+        """, tag_name=tag_name, note_path=note_path, vault_id=vault_id)
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du tag {tag_name} pour la note {note_path}: {e}")
+
 # —— Fonction principale ——
 def create_nodes_and_relations(session, vault_path):
     """
     Parcourt le vault Obsidian et crée les nœuds Dossier et Note dans Neo4j,
-    avec leurs relations PARENT_OF et SIBLING_OF.
+    avec leurs relations PARENT_OF, SIBLING_OF, et HAS_TAG.
     
     Args:
         session (neo4j.Session): Session Neo4j active
@@ -103,7 +239,16 @@ def create_nodes_and_relations(session, vault_path):
     """, root_name=root_name, vault_id=CONFIG["VAULT_ID"])
 
     for dirpath, dirnames, filenames in os.walk(vault_path):
-        # Filtrer les dossiers exclus
+        # Chemin relatif au vault
+        relative_dirpath = normalize_path(dirpath, vault_path)
+
+        # Exclure les dossiers spécifiques
+        if relative_dirpath.startswith("_ASSETS/templates") or relative_dirpath.startswith("_GESTION"):
+            logger.info(f"🚫 Exclusion du dossier : {relative_dirpath}")
+            dirnames[:] = []  # Ne pas explorer les sous-dossiers
+            continue  # Passer au prochain dossier
+
+        # Filtrer les dossiers exclus (ancien comportement)
         dirnames[:] = [d for d in dirnames if d not in CONFIG["EXCLUDED_DIRS"]]
 
         # Calculer le niveau
@@ -163,6 +308,11 @@ def create_nodes_and_relations(session, vault_path):
                 MERGE (dir)-[:PARENT_OF]->(note)
             """, dir_path=relative_dir_path, file_path=relative_file_path, vault_id=CONFIG["VAULT_ID"])
 
+            # Extraire les tags
+            tags = get_all_tags(contenu)
+            for tag_name in tags:
+                create_tag_hierarchy(session, relative_file_path, CONFIG["VAULT_ID"], tag_name)
+
             file_nodes.append(file_name)
 
         # Créer les relations frères
@@ -191,6 +341,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
